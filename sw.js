@@ -1,5 +1,5 @@
 // Offline support: cache the app shell, serve it network-first so updates arrive quickly.
-const CACHE = "podium-v1";
+const CACHE = "podium-v2";
 const FILES = ["./", "./index.html", "./app.js", "./analyze.js", "./data.js", "./manifest.json", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))); self.skipWaiting(); });
