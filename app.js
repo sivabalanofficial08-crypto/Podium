@@ -155,7 +155,7 @@ function targetSeconds() { return settings.speak || MODES[state.mode].defaultSpe
 function startSession() {
   if (session.phase === "prep" || session.phase === "speak") return;
   hideResults();
-  Object.assign(session, { phase: "prep", segments: [], interim: "", pauses: [], startAt: 0, lastHeard: 0, timer: null, audioChunks: [], audioUrl: null, pitch: [], rms: [], daily: state.daily || null });
+  Object.assign(session, { voiceOverride: null, phase: "prep", segments: [], interim: "", pauses: [], startAt: 0, lastHeard: 0, timer: null, audioChunks: [], audioUrl: null, pitch: [], rms: [], daily: state.daily || null });
   state.daily = null;
   $("#live").hidden = false;
   if (settings.prep > 0) runPrep(); else beginSpeaking();
@@ -208,7 +208,7 @@ async function beginSpeaking() {
       <div class="meter"><div class="label">Fillers</div><div class="v" id="mFill">0</div><div class="hint" id="mFillHint">um, like, you know…</div></div>
       <div class="meter"><div class="label">Hedges</div><div class="v" id="mHedge">0</div><div class="hint">I think, maybe…</div></div>
     </div>
-    <div><div class="label" style="margin-bottom:6px">Mic level</div><div class="level"><div id="lvl"></div></div></div>
+    <div><div class="label" style="margin-bottom:6px">Mic level</div><div class="level"><div id="lvl"></div></div><p class="small muted mono" id="diag" style="margin-top:6px">Starting microphone…</p></div>
     <div class="transcript-live" id="liveText"><span class="muted">Start talking. Your words will appear here…</span></div>
     <p class="small muted">Browsers often drop "um" and "uh" from transcripts, so Podium also counts long silences. Your recording plays back after you stop.</p>`}
     <div id="liveErr"></div>`;
@@ -219,7 +219,28 @@ async function beginSpeaking() {
   session.startAt = Date.now();
   session.lastHeard = Date.now();
   session.timer = setInterval(tick, 250);
-  if (!typing) { await startAudio(); startRecognition(); }
+  session.diag = { recStarted: false, recAudio: false, recSpeech: false, results: 0, error: null, peak: 0, micOk: null, warned: false };
+  if (!typing) { startRecognition(); await startAudio(); }
+}
+
+// Live status line + a clear explanation if nothing is being transcribed.
+function updateDiag(el) {
+  const d = session.diag, out = $("#diag"); if (!out) return;
+  const parts = [
+    d.micOk === false ? "mic: blocked" : d.peak > 0.01 ? "mic: hearing you" : d.micOk ? "mic: open, but silent" : "mic: starting",
+    d.error ? `speech: error (${d.error})` : d.results ? `speech: ${d.results} updates` : d.recSpeech ? "speech: hearing voice" : d.recAudio ? "speech: listening" : d.recStarted ? "speech: started" : "speech: not started",
+  ];
+  out.textContent = parts.join(" · ");
+  if (el > 7 && !d.results && !d.warned) {
+    d.warned = true;
+    let why;
+    if (d.error === "not-allowed" || d.error === "service-not-allowed" || d.micOk === false) why = "The microphone is blocked. Click the lock/tune icon left of the address bar → Site settings → Microphone → Allow, then reload. On Android: Settings → Apps → Chrome → Permissions → Microphone.";
+    else if (d.error === "network") why = "Your browser can't reach its speech service. Use Google Chrome or Microsoft Edge (Brave, Opera, Firefox and the Claude app's built-in browser don't support live transcription), and check your internet.";
+    else if (d.error === "audio-capture" || (d.micOk && d.peak < 0.01)) why = "No sound is reaching the mic. Check the right microphone is selected (Chrome: Settings → Privacy → Site settings → Microphone; Windows: Settings → System → Sound → Input) and that it isn't muted.";
+    else if (!d.recStarted) why = "Live transcription didn't start in this browser. Open Podium in Google Chrome or Microsoft Edge.";
+    else why = "The mic is on but no words are being recognised yet. Speak a little louder and closer to the mic. If this keeps happening, try Chrome, or set the accent in Settings.";
+    $("#liveErr").innerHTML = `<div class="notice bad"><b>No words detected yet.</b> ${esc(why)} Your audio is still being recorded, and you can type what you said after stopping.</div>`;
+  }
 }
 
 function tick() {
@@ -229,7 +250,7 @@ function tick() {
   $("#pbar").style.width = Math.min(100, (el / target) * 100) + "%";
   $("#pbar").style.background = el > target ? "var(--onair)" : el > target * 0.85 ? "var(--warn)" : "var(--accent)";
   if (el > target + 30) finishSession();
-  if (!session.typing) updateLiveStats(el);
+  if (!session.typing) { updateLiveStats(el); updateDiag(el); }
 }
 
 function liveText() { return (session.segments.join(" ") + " " + session.interim).trim(); }
@@ -257,7 +278,11 @@ function renderLiveText() {
 function startRecognition() {
   const rec = new SR();
   rec.lang = settings.lang; rec.continuous = true; rec.interimResults = true;
+  rec.onstart = () => (session.diag.recStarted = true);
+  rec.onaudiostart = () => (session.diag.recAudio = true);
+  rec.onspeechstart = () => (session.diag.recSpeech = true);
   rec.onresult = e => {
+    session.diag.results++; session.diag.error = null;
     const now = Date.now();
     const gap = now - session.lastHeard;
     if (session.segments.length && gap > 1200) session.pauses.push(gap);
@@ -272,19 +297,22 @@ function startRecognition() {
   };
   rec.onerror = e => {
     if (e.error === "no-speech" || e.error === "aborted") return;
+    session.diag.error = e.error;
+    if (e.error === "network" || e.error === "not-allowed" || e.error === "service-not-allowed") session.recDead = true;
     const msg = e.error === "not-allowed" ? "Microphone access was blocked. Allow the mic for this page (address bar → site settings), or switch Input to 'Type / paste'." :
       e.error === "network" ? "Speech recognition needs an internet connection in Chrome/Edge." : "Speech recognition error: " + e.error;
     $("#liveErr").innerHTML = `<div class="notice bad">${esc(msg)}</div>`;
   };
-  rec.onend = () => { if (session.phase === "speak") { try { rec.start(); } catch {} } };
-  try { rec.start(); } catch {}
+  rec.onend = () => { if (session.phase === "speak" && !session.recDead) setTimeout(() => { try { rec.start(); } catch {} }, 250); };
+  session.recDead = false;
+  try { rec.start(); } catch (err) { session.diag.error = err.name || "start-failed"; }
   session.rec = rec;
 }
 
 async function startAudio() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
-    session.stream = stream;
+    session.stream = stream; session.diag.micOk = true;
     try {
       const mr = new MediaRecorder(stream);
       mr.ondataavailable = e => e.data.size && session.audioChunks.push(e.data);
@@ -302,6 +330,7 @@ async function startAudio() {
       let sum = 0; for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
       const rms = Math.sqrt(sum / buf.length);
       const lvl = $("#lvl"); if (lvl) lvl.style.width = Math.min(100, rms * 600) + "%";
+      session.diag.peak = Math.max(session.diag.peak * 0.995, rms);
       if (frame++ % 3 === 0 && rms > 0.012) {
         session.rms.push(rms);
         const f = detectPitch(buf, ctx.sampleRate, rms);
@@ -311,6 +340,7 @@ async function startAudio() {
     };
     loop();
   } catch (err) {
+    session.diag.micOk = false;
     $("#liveErr").innerHTML = `<div class="notice">Couldn't open the microphone for voice analysis (${esc(err.name || err.message)}). Transcription may still work; pitch, volume and playback will be skipped.</div>`;
   }
 }
@@ -374,11 +404,41 @@ async function finishSession() {
   if (!session.typing) { $("#stopBtn").disabled = true; $("#stopBtn").textContent = "Analysing…"; await new Promise(r => setTimeout(r, 700)); }
   await stopCapture();
   if (session.interim.trim()) session.segments.push(session.interim.trim());
-  const transcript = session.typing ? ($("#typed")?.value || "") : session.segments.join(". ");
+  if (!session.typing && !session.segments.join("").trim()) return showNoSpeech(durationSec);
+  analyseAndShow(durationSec, session.typing ? ($("#typed")?.value || "") : session.segments.join(". "));
+}
+
+function showNoSpeech(durationSec) {
+  const d = session.diag;
+  $("#live").hidden = false;
+  $("#live").innerHTML = `
+    <div class="live-top"><span class="onair">NO WORDS CAPTURED</span></div>
+    <div class="notice bad">Live transcription didn't pick up any words, so there's nothing to score yet.
+      Status: mic ${d.micOk === false ? "blocked" : d.peak > 0.01 ? "heard sound" : "heard no sound"}, speech service ${d.error ? "error: " + esc(d.error) : d.recStarted ? "ran but recognised nothing" : "didn't start"}.</div>
+    ${session.audioUrl ? `<div><div class="label" style="margin-bottom:6px">Your recording</div><audio controls src="${session.audioUrl}" style="width:100%"></audio></div>` : ""}
+    <label class="field"><span>Type what you said (roughly is fine) to still get feedback</span><textarea id="rescue" style="min-height:160px" placeholder="Listen back to your recording and type your answer here…"></textarea></label>
+    <div class="row"><button class="btn primary" id="rescueGo">Analyse my answer</button><button class="btn" id="rescueRetry">Try speaking again</button></div>
+    <details class="small"><summary style="cursor:pointer;font-weight:600">How to fix the microphone</summary>
+      <ol style="margin:8px 0 0;padding-left:20px;display:grid;gap:4px">
+        <li>Use <b>Google Chrome</b> or <b>Microsoft Edge</b>. Brave, Firefox, Opera and the Claude app's built-in browser can't do live transcription.</li>
+        <li>Allow the mic: click the icon left of the address bar → Site settings → Microphone → Allow, then reload.</li>
+        <li>If the mic-level bar stayed empty, the wrong mic is selected: Windows Settings → System → Sound → Input, and Chrome → Settings → Privacy → Site settings → Microphone.</li>
+        <li>Close other apps using the mic (Zoom, Teams, WhatsApp calls).</li>
+        <li>Stay online: Chrome sends audio to Google's speech service to transcribe it.</li>
+      </ol></details>`;
+  $("#rescueGo").onclick = () => {
+    const t = $("#rescue").value.trim(); if (!t) return toast("Type your answer first");
+    session.typing = true; session.voiceOverride = voiceStats();
+    analyseAndShow(durationSec, t);
+  };
+  $("#rescueRetry").onclick = () => { $("#live").hidden = true; startSession(); };
+}
+
+function analyseAndShow(durationSec, transcript) {
   const segments = session.typing ? transcript.split(/[.!?\n]+/).map(s => s.trim()).filter(Boolean) : session.segments;
   const result = analyze({
     transcript, segments, durationSec, targetSec: targetSeconds(), pauses: session.pauses, mode: state.mode,
-    vocabTargets: state.vocabTargets, voice: session.typing ? null : voiceStats(), vocabBank: VOCAB, typed: session.typing,
+    vocabTargets: state.vocabTargets, voice: session.voiceOverride || (session.typing ? null : voiceStats()), vocabBank: VOCAB, typed: session.typing,
   });
   const entry = {
     id: Date.now(), date: new Date().toISOString(), mode: state.mode, topic: state.topic, transcript: transcript.slice(0, 6000),
