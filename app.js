@@ -17,6 +17,10 @@ let history = store.get("history", []);
 let learned = new Set(store.get("learned", []));
 
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const IS_MOBILE = /Android|iPhone|iPad/i.test(navigator.userAgent);
+if (!settings.engine) settings.engine = "auto";
+// Android lets only one consumer hold the mic, so live recognition and recording can't run together there.
+const useDevice = () => settings.engine === "device" || (settings.engine === "auto" && IS_MOBILE);
 if (!SR && settings.input === "voice") settings.input = "type";
 
 const state = { mode: "impromptu", topic: null, research: null, vocabTargets: [], lastResult: null };
@@ -209,8 +213,8 @@ async function beginSpeaking() {
       <div class="meter"><div class="label">Hedges</div><div class="v" id="mHedge">0</div><div class="hint">I think, maybe…</div></div>
     </div>
     <div><div class="label" style="margin-bottom:6px">Mic level</div><div class="level"><div id="lvl"></div></div><p class="small muted mono" id="diag" style="margin-top:6px">Starting microphone…</p></div>
-    <div class="transcript-live" id="liveText"><span class="muted">Start talking. Your words will appear here…</span></div>
-    <p class="small muted">Browsers often drop "um" and "uh" from transcripts, so Podium also counts long silences. Your recording plays back after you stop.</p>`}
+    <div class="transcript-live" id="liveText"><span class="muted">${useDevice() ? "Recording. Speak naturally: your words are transcribed on this device when you press Stop." : "Start talking. Your words will appear here…"}</span></div>
+    <p class="small muted">${useDevice() ? "Word count and fillers appear in your report after you stop." : 'Browsers often drop "um" and "uh" from transcripts, so Podium also counts long silences.'} Your recording plays back after you stop.</p>`}
     <div id="liveErr"></div>`;
   $("#stopBtn").onclick = () => finishSession();
   $("#cancelBtn").onclick = cancelSession;
@@ -220,12 +224,14 @@ async function beginSpeaking() {
   session.lastHeard = Date.now();
   session.timer = setInterval(tick, 250);
   session.diag = { recStarted: false, recAudio: false, recSpeech: false, results: 0, error: null, peak: 0, micOk: null, warned: false };
-  if (!typing) { startRecognition(); await startAudio(); }
+  session.device = !typing && useDevice();
+  if (!typing) { if (!session.device) startRecognition(); await startAudio(); }
 }
 
 // Live status line + a clear explanation if nothing is being transcribed.
 function updateDiag(el) {
   const d = session.diag, out = $("#diag"); if (!out) return;
+  if (session.device) { out.textContent = (d.micOk === false ? "mic: blocked" : d.peak > 0.01 ? "mic: hearing you" : "mic: starting") + " · transcription: after you stop"; return; }
   const parts = [
     d.micOk === false ? "mic: blocked" : d.peak > 0.01 ? "mic: hearing you" : d.micOk ? "mic: open, but silent" : "mic: starting",
     d.error ? `speech: error (${d.error})` : d.results ? `speech: ${d.results} updates` : d.recSpeech ? "speech: hearing voice" : d.recAudio ? "speech: listening" : d.recStarted ? "speech: started" : "speech: not started",
@@ -430,26 +436,31 @@ async function decodeTo16k(blob) {
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
   const audio = await ctx.decodeAudioData(buf);
   ctx.close();
+  // Mix all channels down (some phones record speech on one channel only), resample to 16 kHz.
   const off = new OfflineAudioContext(1, Math.ceil(audio.duration * 16000), 16000);
   const src = off.createBufferSource(); src.buffer = audio; src.connect(off.destination); src.start();
-  return (await off.startRendering()).getChannelData(0);
+  const pcm = (await off.startRendering()).getChannelData(0);
+  // Phone recordings are often quiet; normalise so the model hears speech clearly.
+  let peak = 0; for (let i = 0; i < pcm.length; i++) peak = Math.max(peak, Math.abs(pcm[i]));
+  if (peak > 0 && peak < 0.9) { const g = Math.min(0.9 / peak, 30); for (let i = 0; i < pcm.length; i++) pcm[i] *= g; }
+  return { pcm, seconds: audio.duration, peak };
 }
 
 async function whisperFallback(durationSec) {
   $("#live").hidden = false;
   $("#live").innerHTML = `
     <div class="live-top"><span class="onair on"><span class="blink"></span>TRANSCRIBING</span></div>
-    <p>Your browser's live transcription returned no words, so Podium is transcribing your recording on this device.</p>
+    <p>${session.device ? "Transcribing your recording on this device." : "Your browser's live transcription returned no words, so Podium is transcribing your recording on this device."}</p>
     <div class="progress-bar"><div id="wbar" style="width:3%"></div></div>
     <p class="small muted" id="wmsg">Loading the speech model (about 40 MB, first time only)…</p>`;
   try {
     const pipe = await loadWhisper(p => { $("#wbar").style.width = Math.max(3, p * 0.7) + "%"; $("#wmsg").textContent = `Downloading speech model… ${p}%`; });
     $("#wbar").style.width = "75%"; $("#wmsg").textContent = "Listening to your recording… (10–40 seconds)";
-    const audio = await decodeTo16k(session.audioBlob);
-    const out = await pipe(audio, { chunk_length_s: 30, stride_length_s: 5, return_timestamps: true });
+    const { pcm, seconds, peak } = await decodeTo16k(session.audioBlob);
+    const out = await pipe(pcm, { chunk_length_s: 30, stride_length_s: 5, return_timestamps: true });
     const chunks = (out.chunks || []).filter(c => c.text.trim());
-    const text = (out.text || "").replace(/\[[^\]]*\]|\([^)]*\)/g, " ").replace(/\s+/g, " ").trim();
-    if (!text) return showNoSpeech(durationSec);
+    const text = (out.text || "").replace(/\[(BLANK_AUDIO|MUSIC|NOISE|SILENCE)\]/gi, " ").replace(/\s+/g, " ").trim();
+    if (!text) return showNoSpeech(durationSec, `On-device transcription heard no words either (audio ${seconds.toFixed(1)} s, ${session.audioBlob.type || "unknown format"}, level ${peak.toFixed(3)}, model said "${(out.text || "").slice(0, 60)}").`);
     // Gaps between Whisper's timestamped chunks stand in for pauses.
     session.pauses = [];
     for (let i = 1; i < chunks.length; i++) { const g = (chunks[i].timestamp[0] - chunks[i - 1].timestamp[1]) * 1000; if (g > 1200) session.pauses.push(g); }
@@ -471,7 +482,7 @@ function showNoSpeech(durationSec, extra) {
       Status: mic ${d.micOk === false ? "blocked" : d.peak > 0.01 ? "heard sound" : "heard no sound"}, speech service ${d.error ? "error: " + esc(d.error) : d.recStarted ? "ran but recognised nothing" : "didn't start"}.${extra ? " " + esc(extra) : ""}</div>
     ${session.audioUrl ? `<div><div class="label" style="margin-bottom:6px">Your recording</div><audio controls src="${session.audioUrl}" style="width:100%"></audio></div>` : ""}
     <label class="field"><span>Type what you said (roughly is fine) to still get feedback</span><textarea id="rescue" style="min-height:160px" placeholder="Listen back to your recording and type your answer here…"></textarea></label>
-    <div class="row"><button class="btn primary" id="rescueGo">Analyse my answer</button><button class="btn" id="rescueRetry">Try speaking again</button></div>
+    <div class="row"><button class="btn primary" id="rescueGo">Analyse my answer</button>${session.audioBlob ? '<button class="btn" id="rescueWhisper">Transcribe recording again</button>' : ""}<button class="btn" id="rescueRetry">Try speaking again</button></div>
     <details class="small"><summary style="cursor:pointer;font-weight:600">How to fix the microphone</summary>
       <ol style="margin:8px 0 0;padding-left:20px;display:grid;gap:4px">
         <li>Use <b>Google Chrome</b> or <b>Microsoft Edge</b>. Brave, Firefox, Opera and the Claude app's built-in browser can't do live transcription.</li>
@@ -486,6 +497,7 @@ function showNoSpeech(durationSec, extra) {
     analyseAndShow(durationSec, t);
   };
   $("#rescueRetry").onclick = () => { $("#live").hidden = true; startSession(); };
+  if ($("#rescueWhisper")) $("#rescueWhisper").onclick = () => whisperFallback(durationSec);
 }
 
 function analyseAndShow(durationSec, transcript) {
@@ -875,6 +887,8 @@ function renderSettings() {
         <label class="field"><span>Speech recognition accent</span>
           <select id="sLang">${[["en-IN", "English (India)"], ["en-US", "English (US)"], ["en-GB", "English (UK)"], ["en-AU", "English (Australia)"], ["en-CA", "English (Canada)"]].map(([c, l]) => `<option value="${c}" ${settings.lang === c ? "selected" : ""}>${l}</option>`).join("")}</select></label>
         <p class="small muted">Pick the accent closest to yours for more accurate transcripts.</p>
+        <label class="field"><span>Transcription</span>
+          <select id="sEngine">${[["auto", `Automatic (${IS_MOBILE ? "on-device on this phone" : "live in this browser"})`], ["live", "Live: words appear as you speak (Chrome/Edge on a computer)"], ["device", "On-device: transcribed after you stop (most reliable, works on phones)"]].map(([c, l]) => `<option value="${c}" ${settings.engine === c ? "selected" : ""}>${l}</option>`).join("")}</select></label>
       </div>
       <div class="panel" style="display:grid;gap:14px">
         <div><h3 style="font-size:18px">AI coach</h3><p class="small muted" style="margin-top:4px">Optional. With an Anthropic API key, each session gets in-depth coaching and a rewritten "stronger version" of your answer. The key is stored only in this browser and sent only to api.anthropic.com. Without a key, use "Copy prompt for Claude.ai" on any result.</p></div>
@@ -890,6 +904,7 @@ function renderSettings() {
       </div>
     </div>`;
   $("#sLang").onchange = e => { settings.lang = e.target.value; saveSettings(); toast("Accent saved"); };
+  $("#sEngine").onchange = e => { settings.engine = e.target.value; saveSettings(); toast("Transcription setting saved"); };
   $("#sSave").onclick = () => { settings.apiKey = $("#sKey").value.trim(); settings.model = $("#sModel").value; saveSettings(); toast("Settings saved"); };
   $("#sExport").onclick = () => {
     const blob = new Blob([JSON.stringify({ history, learned: [...learned] }, null, 2)], { type: "application/json" });
