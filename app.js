@@ -420,12 +420,14 @@ async function finishSession() {
 // ---------------- On-device transcription (Whisper) ----------------
 // Used when the browser's live speech service returns nothing. Runs entirely in the browser;
 // the model (~40 MB) downloads once and is cached.
-let whisperPipe = null;
+let whisperPipe = null, whisperName = null;
 async function loadWhisper(onProgress) {
-  if (whisperPipe) return whisperPipe;
+  const name = settings.accuracy === "high" ? "Xenova/whisper-small.en" : "Xenova/whisper-base.en";
+  if (whisperPipe && whisperName === name) return whisperPipe;
+  whisperName = name;
   const { pipeline, env } = await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2");
   env.allowLocalModels = false;
-  whisperPipe = await pipeline("automatic-speech-recognition", "Xenova/whisper-base.en", {
+  whisperPipe = await pipeline("automatic-speech-recognition", name, {
     progress_callback: p => { if (p.status === "progress" && p.file?.endsWith(".onnx")) onProgress(Math.round(p.progress)); },
   });
   return whisperPipe;
@@ -442,8 +444,42 @@ async function decodeTo16k(blob) {
   const pcm = (await off.startRendering()).getChannelData(0);
   // Phone recordings are often quiet; normalise so the model hears speech clearly.
   let peak = 0; for (let i = 0; i < pcm.length; i++) peak = Math.max(peak, Math.abs(pcm[i]));
-  if (peak > 0 && peak < 0.9) { const g = Math.min(0.9 / peak, 30); for (let i = 0; i < pcm.length; i++) pcm[i] *= g; }
+  if (peak > 0 && peak < 0.9) { const g = Math.min(0.9 / peak, 8); for (let i = 0; i < pcm.length; i++) pcm[i] *= g; }
   return { pcm, seconds: audio.duration, peak };
+}
+
+// Split 16 kHz audio into <=25 s pieces at natural pauses, and measure the pauses themselves.
+function splitAtPauses(pcm) {
+  const SR16 = 16000, F = 480; // 30 ms frames
+  const n = Math.floor(pcm.length / F), e = new Float32Array(n);
+  for (let f = 0; f < n; f++) { let s = 0; for (let i = f * F; i < (f + 1) * F; i++) s += pcm[i] * pcm[i]; e[f] = Math.sqrt(s / F); }
+  const sorted = [...e].sort((a, b) => a - b);
+  const floor = sorted[Math.floor(n * 0.1)] || 0, loud = sorted[Math.floor(n * 0.9)] || 0;
+  const thr = Math.max(floor * 2.5, loud * 0.12, 0.005);
+  const voiced = Array.from(e, v => v > thr);
+  // Pauses: runs of silence between speech, in ms.
+  const pauses = [];
+  let firstV = voiced.indexOf(true), lastV = voiced.lastIndexOf(true), run = 0;
+  for (let f = firstV; f >= 0 && f <= lastV; f++) { if (!voiced[f]) run++; else { if (run * 30 >= 1200) pauses.push(run * 30); run = 0; } }
+  // Cut points: after 15 s, take the middle of the first silence >= 0.3 s; force a cut by 25 s.
+  const pieces = [];
+  let start = 0;
+  while (start < n) {
+    let end = Math.min(n, start + Math.round(25000 / 30));
+    if (end < n) {
+      let best = -1, sil = 0;
+      for (let f = start + Math.round(15000 / 30); f < end; f++) {
+        if (!voiced[f]) { sil++; if (sil >= 10 && best < 0) best = f - Math.floor(sil / 2); } else sil = 0;
+        if (best >= 0 && voiced[f]) break;
+      }
+      if (best > start) end = best;
+    }
+    const seg = pcm.subarray(start * F, Math.min(pcm.length, end * F));
+    if (voiced.slice(start, end).some(Boolean)) pieces.push(seg);
+    start = end;
+  }
+  if (!pieces.length && pcm.length) pieces.push(pcm);
+  return { pieces, pauses };
 }
 
 async function whisperFallback(durationSec) {
@@ -452,18 +488,22 @@ async function whisperFallback(durationSec) {
     <div class="live-top"><span class="onair on"><span class="blink"></span>TRANSCRIBING</span></div>
     <p>${session.device ? "Transcribing your recording on this device." : "Your browser's live transcription returned no words, so Podium is transcribing your recording on this device."}</p>
     <div class="progress-bar"><div id="wbar" style="width:3%"></div></div>
-    <p class="small muted" id="wmsg">Loading the speech model (about 40 MB, first time only)…</p>`;
+    <p class="small muted" id="wmsg">Loading the speech model (${settings.accuracy === "high" ? "about 250 MB" : "about 40 MB"}, first time only)…</p>`;
   try {
     const pipe = await loadWhisper(p => { $("#wbar").style.width = Math.max(3, p * 0.7) + "%"; $("#wmsg").textContent = `Downloading speech model… ${p}%`; });
     $("#wbar").style.width = "75%"; $("#wmsg").textContent = "Listening to your recording… (10–40 seconds)";
     const { pcm, seconds, peak } = await decodeTo16k(session.audioBlob);
-    const out = await pipe(pcm, { chunk_length_s: 30, stride_length_s: 5, return_timestamps: true });
-    const chunks = (out.chunks || []).filter(c => c.text.trim());
-    const text = (out.text || "").replace(/\[(BLANK_AUDIO|MUSIC|NOISE|SILENCE)\]/gi, " ").replace(/\s+/g, " ").trim();
-    if (!text) return showNoSpeech(durationSec, `On-device transcription heard no words either (audio ${seconds.toFixed(1)} s, ${session.audioBlob.type || "unknown format"}, level ${peak.toFixed(3)}, model said "${(out.text || "").slice(0, 60)}").`);
-    // Gaps between Whisper's timestamped chunks stand in for pauses.
-    session.pauses = [];
-    for (let i = 1; i < chunks.length; i++) { const g = (chunks[i].timestamp[0] - chunks[i - 1].timestamp[1]) * 1000; if (g > 1200) session.pauses.push(g); }
+    const { pieces, pauses } = splitAtPauses(pcm);
+    const parts = [];
+    for (let i = 0; i < pieces.length; i++) {
+      $("#wmsg").textContent = `Transcribing part ${i + 1} of ${pieces.length}…`;
+      $("#wbar").style.width = 75 + Math.round((i / pieces.length) * 25) + "%";
+      const out = await pipe(pieces[i]);
+      parts.push((out.text || "").replace(/\[(BLANK_AUDIO|MUSIC|NOISE|SILENCE)\]|\((?:silence|music|noise)\)/gi, " "));
+    }
+    const text = parts.join(" ").replace(/\s+/g, " ").trim();
+    if (!text) return showNoSpeech(durationSec, `On-device transcription heard no words either (audio ${seconds.toFixed(1)} s, ${pieces.length} parts, ${session.audioBlob.type || "unknown format"}, level ${peak.toFixed(3)}).`);
+    session.pauses = pauses;
     session.segments = text.split(/(?<=[.!?])\s+/).map(s => s.trim()).filter(Boolean);
     session.transcriber = "whisper";
     analyseAndShow(durationSec, text);
@@ -889,6 +929,8 @@ function renderSettings() {
         <p class="small muted">Pick the accent closest to yours for more accurate transcripts.</p>
         <label class="field"><span>Transcription</span>
           <select id="sEngine">${[["auto", `Automatic (${IS_MOBILE ? "on-device on this phone" : "live in this browser"})`], ["live", "Live: words appear as you speak (Chrome/Edge on a computer)"], ["device", "On-device: transcribed after you stop (most reliable, works on phones)"]].map(([c, l]) => `<option value="${c}" ${settings.engine === c ? "selected" : ""}>${l}</option>`).join("")}</select></label>
+        <label class="field"><span>On-device accuracy</span>
+          <select id="sAcc">${[["standard", "Standard: fast, 40 MB download"], ["high", "High: better with accents, 250 MB download, slower"]].map(([c, l]) => `<option value="${c}" ${(settings.accuracy || "standard") === c ? "selected" : ""}>${l}</option>`).join("")}</select></label>
       </div>
       <div class="panel" style="display:grid;gap:14px">
         <div><h3 style="font-size:18px">AI coach</h3><p class="small muted" style="margin-top:4px">Optional. With an Anthropic API key, each session gets in-depth coaching and a rewritten "stronger version" of your answer. The key is stored only in this browser and sent only to api.anthropic.com. Without a key, use "Copy prompt for Claude.ai" on any result.</p></div>
@@ -905,6 +947,7 @@ function renderSettings() {
     </div>`;
   $("#sLang").onchange = e => { settings.lang = e.target.value; saveSettings(); toast("Accent saved"); };
   $("#sEngine").onchange = e => { settings.engine = e.target.value; saveSettings(); toast("Transcription setting saved"); };
+  $("#sAcc").onchange = e => { settings.accuracy = e.target.value; saveSettings(); toast("Accuracy setting saved"); };
   $("#sSave").onclick = () => { settings.apiKey = $("#sKey").value.trim(); settings.model = $("#sModel").value; saveSettings(); toast("Settings saved"); };
   $("#sExport").onclick = () => {
     const blob = new Blob([JSON.stringify({ history, learned: [...learned] }, null, 2)], { type: "application/json" });
