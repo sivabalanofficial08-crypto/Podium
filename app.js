@@ -155,7 +155,7 @@ function targetSeconds() { return settings.speak || MODES[state.mode].defaultSpe
 function startSession() {
   if (session.phase === "prep" || session.phase === "speak") return;
   hideResults();
-  Object.assign(session, { voiceOverride: null, phase: "prep", segments: [], interim: "", pauses: [], startAt: 0, lastHeard: 0, timer: null, audioChunks: [], audioUrl: null, pitch: [], rms: [], daily: state.daily || null });
+  Object.assign(session, { voiceOverride: null, audioBlob: null, phase: "prep", segments: [], interim: "", pauses: [], startAt: 0, lastHeard: 0, timer: null, audioChunks: [], audioUrl: null, pitch: [], rms: [], daily: state.daily || null });
   state.daily = null;
   $("#live").hidden = false;
   if (settings.prep > 0) runPrep(); else beginSpeaking();
@@ -239,7 +239,7 @@ function updateDiag(el) {
     else if (d.error === "audio-capture" || (d.micOk && d.peak < 0.01)) why = "No sound is reaching the mic. Check the right microphone is selected (Chrome: Settings → Privacy → Site settings → Microphone; Windows: Settings → System → Sound → Input) and that it isn't muted.";
     else if (!d.recStarted) why = "Live transcription didn't start in this browser. Open Podium in Google Chrome or Microsoft Edge.";
     else why = "The mic is on but no words are being recognised yet. Speak a little louder and closer to the mic. If this keeps happening, try Chrome, or set the accent in Settings.";
-    $("#liveErr").innerHTML = `<div class="notice bad"><b>No words detected yet.</b> ${esc(why)} Your audio is still being recorded, and you can type what you said after stopping.</div>`;
+    $("#liveErr").innerHTML = `<div class="notice bad"><b>No words detected yet.</b> ${esc(why)} ${d.micOk && d.peak > 0.01 ? "Keep talking: your recording is fine, and Podium will transcribe it on this device when you stop." : "Your audio is still being recorded, and you can type what you said after stopping."}</div>`;
   }
 }
 
@@ -383,7 +383,7 @@ function stopCapture() {
     const done = () => {
       try { session.stream && session.stream.getTracks().forEach(t => t.stop()); } catch {}
       try { session.ctx && session.ctx.close(); } catch {}
-      if (session.audioChunks.length) session.audioUrl = URL.createObjectURL(new Blob(session.audioChunks, { type: session.mr?.mimeType || "audio/webm" }));
+      if (session.audioChunks.length) { session.audioBlob = new Blob(session.audioChunks, { type: session.mr?.mimeType || "audio/webm" }); session.audioUrl = URL.createObjectURL(session.audioBlob); }
       resolve();
     };
     if (session.mr && session.mr.state !== "inactive") { session.mr.onstop = done; session.mr.stop(); } else done();
@@ -404,17 +404,71 @@ async function finishSession() {
   if (!session.typing) { $("#stopBtn").disabled = true; $("#stopBtn").textContent = "Analysing…"; await new Promise(r => setTimeout(r, 700)); }
   await stopCapture();
   if (session.interim.trim()) session.segments.push(session.interim.trim());
-  if (!session.typing && !session.segments.join("").trim()) return showNoSpeech(durationSec);
+  if (!session.typing && !session.segments.join("").trim()) {
+    if (session.audioBlob) return whisperFallback(durationSec);
+    return showNoSpeech(durationSec);
+  }
   analyseAndShow(durationSec, session.typing ? ($("#typed")?.value || "") : session.segments.join(". "));
 }
 
-function showNoSpeech(durationSec) {
+// ---------------- On-device transcription (Whisper) ----------------
+// Used when the browser's live speech service returns nothing. Runs entirely in the browser;
+// the model (~40 MB) downloads once and is cached.
+let whisperPipe = null;
+async function loadWhisper(onProgress) {
+  if (whisperPipe) return whisperPipe;
+  const { pipeline, env } = await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2");
+  env.allowLocalModels = false;
+  whisperPipe = await pipeline("automatic-speech-recognition", "Xenova/whisper-base.en", {
+    progress_callback: p => { if (p.status === "progress" && p.file?.endsWith(".onnx")) onProgress(Math.round(p.progress)); },
+  });
+  return whisperPipe;
+}
+
+async function decodeTo16k(blob) {
+  const buf = await blob.arrayBuffer();
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const audio = await ctx.decodeAudioData(buf);
+  ctx.close();
+  const off = new OfflineAudioContext(1, Math.ceil(audio.duration * 16000), 16000);
+  const src = off.createBufferSource(); src.buffer = audio; src.connect(off.destination); src.start();
+  return (await off.startRendering()).getChannelData(0);
+}
+
+async function whisperFallback(durationSec) {
+  $("#live").hidden = false;
+  $("#live").innerHTML = `
+    <div class="live-top"><span class="onair on"><span class="blink"></span>TRANSCRIBING</span></div>
+    <p>Your browser's live transcription returned no words, so Podium is transcribing your recording on this device.</p>
+    <div class="progress-bar"><div id="wbar" style="width:3%"></div></div>
+    <p class="small muted" id="wmsg">Loading the speech model (about 40 MB, first time only)…</p>`;
+  try {
+    const pipe = await loadWhisper(p => { $("#wbar").style.width = Math.max(3, p * 0.7) + "%"; $("#wmsg").textContent = `Downloading speech model… ${p}%`; });
+    $("#wbar").style.width = "75%"; $("#wmsg").textContent = "Listening to your recording… (10–40 seconds)";
+    const audio = await decodeTo16k(session.audioBlob);
+    const out = await pipe(audio, { chunk_length_s: 30, stride_length_s: 5, return_timestamps: true });
+    const chunks = (out.chunks || []).filter(c => c.text.trim());
+    const text = (out.text || "").replace(/\[[^\]]*\]|\([^)]*\)/g, " ").replace(/\s+/g, " ").trim();
+    if (!text) return showNoSpeech(durationSec);
+    // Gaps between Whisper's timestamped chunks stand in for pauses.
+    session.pauses = [];
+    for (let i = 1; i < chunks.length; i++) { const g = (chunks[i].timestamp[0] - chunks[i - 1].timestamp[1]) * 1000; if (g > 1200) session.pauses.push(g); }
+    session.segments = text.split(/(?<=[.!?])\s+/).map(s => s.trim()).filter(Boolean);
+    session.transcriber = "whisper";
+    analyseAndShow(durationSec, text);
+  } catch (err) {
+    console.error(err);
+    showNoSpeech(durationSec, "On-device transcription failed (" + (err.message || err) + "). Check your internet for the first-time model download.");
+  }
+}
+
+function showNoSpeech(durationSec, extra) {
   const d = session.diag;
   $("#live").hidden = false;
   $("#live").innerHTML = `
     <div class="live-top"><span class="onair">NO WORDS CAPTURED</span></div>
     <div class="notice bad">Live transcription didn't pick up any words, so there's nothing to score yet.
-      Status: mic ${d.micOk === false ? "blocked" : d.peak > 0.01 ? "heard sound" : "heard no sound"}, speech service ${d.error ? "error: " + esc(d.error) : d.recStarted ? "ran but recognised nothing" : "didn't start"}.</div>
+      Status: mic ${d.micOk === false ? "blocked" : d.peak > 0.01 ? "heard sound" : "heard no sound"}, speech service ${d.error ? "error: " + esc(d.error) : d.recStarted ? "ran but recognised nothing" : "didn't start"}.${extra ? " " + esc(extra) : ""}</div>
     ${session.audioUrl ? `<div><div class="label" style="margin-bottom:6px">Your recording</div><audio controls src="${session.audioUrl}" style="width:100%"></audio></div>` : ""}
     <label class="field"><span>Type what you said (roughly is fine) to still get feedback</span><textarea id="rescue" style="min-height:160px" placeholder="Listen back to your recording and type your answer here…"></textarea></label>
     <div class="row"><button class="btn primary" id="rescueGo">Analyse my answer</button><button class="btn" id="rescueRetry">Try speaking again</button></div>
